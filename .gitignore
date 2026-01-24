@@ -1,0 +1,6 @@
+docs
+guides
+.venv
+*__pycache__
+*.pyc
+*ipynb
