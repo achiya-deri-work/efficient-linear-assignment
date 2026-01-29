@@ -4,3 +4,9 @@ guides
 *__pycache__
 *.pyc
 *ipynb
+tests
+*.png
+*architecture*
+.pytest_cache
+
+
