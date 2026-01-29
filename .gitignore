@@ -1,12 +1,26 @@
-docs
-guides
-.venv
-*__pycache__
+# Build Artifacts
+build/
+dist/
+*.egg-info/
+*.so
+__pycache__/
 *.pyc
-*ipynb
-tests
-*.png
-*architecture*
-.pytest_cache
+.pytest_cache/
 
+# Environments
+.venv/
+.env
 
+# Logs & Data
+*.log
+*.csv
+build_log.txt
+
+# Dev Scripts & Tools (Not for public repo)
+benchmark*.py
+plot_benchmarks.py
+verify_*.py
+
+# IDEs
+.vscode/
+.idea/
