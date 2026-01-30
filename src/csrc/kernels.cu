@@ -429,7 +429,7 @@ void launch_bid_kernel_cuda(
     int N = benefits.size(1);
     int M = benefits.size(2);
     dim3 grid(N, B);
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(benefits.scalar_type(), "match_bid_kernel", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BFLOAT16(benefits.scalar_type(), "match_bid_kernel", ([&] {
         match_bid_kernel_wrapper<scalar_t><<<grid, 256>>>(
             benefits.data_ptr<scalar_t>(),
             prices.data_ptr<float>(),     
@@ -483,7 +483,7 @@ std::vector<torch::Tensor> solve_auction_cuda(
         // Init Barrier
         barrier_state = torch::zeros({2}, options.dtype(torch::kInt32));
         
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(benefits.scalar_type(), "auction_persistent_wrapper", ([&] {
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BFLOAT16(benefits.scalar_type(), "auction_persistent_wrapper", ([&] {
             int max_blocks_per_sm = 0;
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &max_blocks_per_sm,
@@ -534,7 +534,7 @@ std::vector<torch::Tensor> solve_auction_cuda(
              bool do_check = (i % check_interval == 0) || (i == max_iter - 1);
         
              // Bid
-             AT_DISPATCH_FLOATING_TYPES_AND_HALF(benefits.scalar_type(), "match_bid", ([&] {
+             AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BFLOAT16(benefits.scalar_type(), "match_bid", ([&] {
                  match_bid_kernel_wrapper<scalar_t><<<bid_grid, 256>>>(
                      benefits.data_ptr<scalar_t>(),
                      prices.data_ptr<float>(),

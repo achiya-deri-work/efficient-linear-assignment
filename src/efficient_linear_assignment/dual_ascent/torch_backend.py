@@ -37,34 +37,20 @@ def l2_regularized_dual_ascent(
     beta = torch.zeros(B, 1, M, device=device, dtype=dtype)
     
     for _ in range(num_iters):
-        # --- Row Update (Newton Step) ---
-        # Current plan P = ReLU(alpha + beta - C) / epsilon
+        # Gradient Ascent Logic (Stable)
+        step_size = epsilon * 0.5
+        
+        # --- Row Update ---
         T = alpha + beta - C
-        active_mask = (T > 0).float() # Keeps gradient flow? No, mask is discrete.
-        # But in backward pass, gradients flow through alpha/beta that made T > 0.
-        # This is essentially ReLU gradient.
+        P = torch.relu(T) / epsilon
+        current_sum = P.sum(dim=2, keepdim=True)
+        alpha = alpha + step_size * (mu.unsqueeze(-1) - current_sum)
         
-        # Calculate current mass and gradient (count of active elements)
-        current_sum = (T * active_mask).sum(dim=2, keepdim=True) / epsilon
-        active_count = active_mask.sum(dim=2, keepdim=True)
-        
-        # Newton Update: alpha += (Target - Current) / Gradient
-        # Clamp gradient to avoid division by zero for inactive rows
-        grad = active_count.clamp(min=1e-6) / epsilon
-        delta = (mu.unsqueeze(-1) - current_sum) / grad
-        alpha = alpha + delta
-        
-        # --- Column Update (Newton Step) ---
-        # Recompute T with updated alpha
+        # --- Column Update ---
         T = alpha + beta - C
-        active_mask = (T > 0).float()
-        
-        current_sum = (T * active_mask).sum(dim=1, keepdim=True) / epsilon
-        active_count = active_mask.sum(dim=1, keepdim=True)
-        
-        grad = active_count.clamp(min=1e-6) / epsilon
-        delta = (nu.unsqueeze(1) - current_sum) / grad
-        beta = beta + delta
+        P = torch.relu(T) / epsilon
+        current_sum = P.sum(dim=1, keepdim=True)
+        beta = beta + step_size * (nu.unsqueeze(1) - current_sum)
         
     # Final projection
     # Force output to be max(0, X)

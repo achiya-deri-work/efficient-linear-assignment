@@ -16,6 +16,12 @@ try:
 except ImportError:
     pass
 
+try:
+    from .cutlass_backend import l2_regularized_dual_ascent_cutlass
+    BACKENDS['cutlass'] = l2_regularized_dual_ascent_cutlass
+except ImportError:
+    pass
+
 def l2_regularized_dual_ascent(C, mu=None, nu=None, epsilon=1.0, num_iters=10, backend=None):
     if backend is None:
         backend = 'torch'

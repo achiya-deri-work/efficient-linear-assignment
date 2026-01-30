@@ -598,7 +598,9 @@ class AuctionTriton:
         benefits = -cost_matrix
         
         B, N, M = benefits.shape
-        prices = torch.zeros((B, M), device=benefits.device, dtype=torch.float32)
+        # User Request: Momory Transfer in Float16 (if input is F16)
+        # We store prices in same dtype as benefits.
+        prices = torch.zeros((B, M), device=benefits.device, dtype=benefits.dtype)
         assignment = torch.full((B, N), -1, device=benefits.device, dtype=torch.long)
         
         # Pre-allocate buffers

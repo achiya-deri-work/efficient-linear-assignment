@@ -27,6 +27,25 @@ try:
 except ImportError:
     pass
 
+try:
+    from .cutlass_backend import solve_auction_cutlass
+    # Wrapper helper to match interface
+    class AuctionCutlass:
+        def __init__(self, epsilon, max_iter):
+            self.epsilon = epsilon
+            self.max_iter = max_iter
+        def solve(self, cost_matrix):
+            # returns indices (B, N)
+            indices = solve_auction_cutlass(cost_matrix, self.epsilon, self.max_iter)
+            return indices, None # No prices for now
+    BACKENDS['cutlass'] = AuctionCutlass
+except ImportError:
+    pass
+
+# Alias 'cuda' to 'cpp' for legacy support
+if 'cpp' in BACKENDS:
+    BACKENDS['cuda'] = BACKENDS['cpp']
+
 class AuctionIMLE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, cost_matrix: torch.Tensor, epsilon: float, max_iter: int, backend_name: str):

@@ -17,6 +17,12 @@ try:
 except ImportError:
     pass
 
+try:
+    from .cutlass_backend import log_stabilized_sinkhorn_cutlass
+    BACKENDS['cutlass'] = log_stabilized_sinkhorn_cutlass
+except ImportError:
+    pass
+
 def log_stabilized_sinkhorn(C, mu=None, nu=None, epsilon=0.1, num_iters=20, backend=None):
     if backend is None:
         backend = 'torch' # Default

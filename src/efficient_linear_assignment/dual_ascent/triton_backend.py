@@ -2,6 +2,17 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=2),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+    ],
+    key=['B', 'N', 'M'],
+)
 @triton.jit
 def _dual_ascent_update_kernel(
     C_ptr,           # (B, N, M)
@@ -83,15 +94,16 @@ def _dual_ascent_update_kernel(
         curr_count = tl.where(is_active, 1.0, 0.0)
         count_active += tl.sum(curr_count, 0)
         
-    # Scale by epsilon
-    current_sum = sum_t_active / epsilon
-    grad = count_active / epsilon
+    # Scale by epsilon to get P
+    current_sum_P = sum_t_active / epsilon
     
-    # Newton Step
-    # Clamp grad
-    grad = tl.maximum(grad, 1e-6)
+    # Gradient Ascent Step
+    # grad = marginal - sum(P)
+    # alpha += step * grad
+    step_size = epsilon * 0.5
     
-    delta = (target_sum - current_sum) / grad
+    grad_ascent = target_sum - current_sum_P
+    delta = step_size * grad_ascent
     
     new_alpha = alpha_val + delta
     
@@ -117,8 +129,7 @@ def l2_regularized_dual_ascent_triton(
     alpha = torch.zeros(B, N, device=device, dtype=C.dtype)
     beta = torch.zeros(B, M, device=device, dtype=C.dtype)
     
-    BLOCK_SIZE = min(triton.next_power_of_2(max(N, M)), 1024)
-    if BLOCK_SIZE < 128: BLOCK_SIZE = 128
+
 
     stride_cb, stride_cn, stride_cm = C.stride()
     
@@ -134,7 +145,6 @@ def l2_regularized_dual_ascent_triton(
             mu.stride(0), mu.stride(1),
             epsilon,
             True, # is_row_update
-            BLOCK_SIZE=BLOCK_SIZE
         )
         
         # Col Update: Updates beta based on alpha
@@ -148,7 +158,6 @@ def l2_regularized_dual_ascent_triton(
             nu.stride(0), nu.stride(1),
             epsilon,
             False, # is_col_update
-            BLOCK_SIZE=BLOCK_SIZE
         )
         
     # Primal reconstruction

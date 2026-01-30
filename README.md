@@ -139,15 +139,21 @@ Results from benchmarking on NVIDIA GeForce RTX 5070 Ti (B=1).
 
 **Comparison vs. Baseline (`torch`) and External (`torch-linear-assignment` Hungarian implementation).**
 
-| Size (N) | CPU Hungarian (ms) | Torch (ms) | Triton (ms) | **Proprietary C++ (ms)** | Abs. Speedup vs Torch |
-| :------- | :----------------- | :--------- | :---------- | :----------------------- | :-------------------- |
-| **128**  | 7.94               | 1,728      | 44.1        | **5.8**                  | **~298x**             |
-| **256**  | 59.55              | 3,630      | 76.8        | **14.8**                 | **~245x**             |
-| **512**  | 283.20             | 15,279     | 241.0       | **91.9**                 | **~166x**             |
-| **1024** | 1,788.80           | 19,706     | 153.9       | **77.3**                 | **~254x**             |
-| **4096** | N/A                | 6,052\*    | 166.8       | **89.0**                 | **~67x**              |
+**Comparison vs. Baseline (`torch`) at 4096x4096**
 
-_(Torch timings N<1024 are notably slow due to Python overhead in the iterative loop)_
+| Algo            | Precision | Torch (ms) | Triton (ms) | **CUDA (ms)** |
+| :-------------- | :-------- | :--------- | :---------- | :------------ |
+| **Sinkhorn**    | FP32      | 24.97      | 8.22        | **10.33**     |
+|                 | FP16      | 10.09      | 7.15        | **8.92**      |
+|                 | **BF16**  | 10.17      | 7.30        | **8.70**      |
+| **Dual Ascent** | FP32      | 18.91      | 4.39        | **5.27**      |
+|                 | FP16      | 17.90      | 3.63        | **4.43**      |
+|                 | **BF16**  | 17.91      | 3.68        | **4.31**      |
+| **Routing**     | FP32      | 28.44      | 6.63        | **7.97**      |
+|                 | FP16      | 27.06      | 5.53        | **6.45**      |
+|                 | **BF16**  | 27.05      | 5.48        | **6.56**      |
+
+_(Benchmarks on NVIDIA GPU, B=1, N=4096)_
 
 ### Benchmark Visuals
 
