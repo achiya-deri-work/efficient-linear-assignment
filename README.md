@@ -1,8 +1,15 @@
-# Efficient Linear Assignment
+# Efficient Differentiable Linear Assignment Suite
 
-A high-performance, differentiable solver for the **Linear Assignment Problem (LAP)**, built on PyTorch.
+A library of high-performance, differentiable solvers for **Optimal Transport**, **Linear Assignment**, and **Routing** problems, accelerated by **Triton** and **CUDA**.
 
-This library implements the **Auction Algorithm** with GPU acceleration via **Triton** and **CUDA/C++** backends. It is designed for deep learning pipelines where assignments need to be computed dynamically during training (e.g., set prediction, tracking, matching).
+This suite includes:
+
+1.  **Auction Algorithm**: Combinatorial exact matching (LAP).
+2.  **Log-Stabilized Sinkhorn**: Differentiable Entropic Optimal Transport.
+3.  **L2-Regularized Dual Ascent**: Sparse, structured attention/matching.
+4.  **MaxScore Routing**: Capacity-constrained routing for MoE/Expert models.
+
+Designed for deep learning pipelines where assignments must be computed dynamically and differentiably during training.
 
 ## Features
 
@@ -26,35 +33,74 @@ _Requirements_:
 
 ## Usage
 
-### Basic Example
+### 1. Linear Assignment (Exact - Auction)
+
+Ideal for exact bipartite matching (1-to-1).
 
 ```python
-import torch
 from efficient_linear_assignment import linear_assignment
 
-# 1. Create a Cost Matrix (Batch, N, M)
-# Constraints: N and M must be multiples of 8.
-B, N, M = 4, 128, 128
-cost_matrix = torch.rand((B, N, M), device='cuda', dtype=torch.float16)
+# B=Batch, N=Workers, M=Jobs (N=M for LAP)
+cost_matrix = torch.rand((4, 128, 128), device='cuda')
 
-# 2. Solve (Returns Indices)
-# indices: (B, N) tensor where indices[b, i] = j means agent i assigned to object j
+# Returns Indices (B, N)
 indices = linear_assignment(
     cost_matrix,
-    backend='cpp',  # Options: 'torch', 'triton', 'cpp'
-    epsilon=1e-2,
-    max_iter=1000
+    backend='cpp', # 'torch', 'triton', 'cpp'
+    epsilon=1e-2
 )
+```
 
-# 3. Solve (Returns One-Hot Matrix for Gradients)
-assignment_matrix = linear_assignment(
+### 2. Entropic Optimal Transport (Sinkhorn)
+
+Differentiable soft-matching with entropic regularization.
+
+```python
+from efficient_linear_assignment import log_stabilized_sinkhorn
+
+# Returns Transport Matrix P (B, N, M)
+P = log_stabilized_sinkhorn(
     cost_matrix,
-    backend='triton',
-    return_indices=False
+    epsilon=0.1,
+    num_iters=20,
+    backend='triton' # 'torch', 'triton', 'cuda'
 )
-# assignment_matrix is differentiable!
-loss = (assignment_matrix * cost_matrix).sum()
-loss.backward()
+# P sums to 1/N rows and 1/M cols (uniform marginals by default)
+```
+
+### 3. Sparse Matching (Dual Ascent)
+
+L2-Regularized OT producing sparse, structured transport plans.
+
+```python
+from efficient_linear_assignment import l2_regularized_dual_ascent
+
+# Returns Transport Matrix P (B, N, M)
+P = l2_regularized_dual_ascent(
+    cost_matrix,
+    epsilon=1.0,
+    num_iters=10,
+    backend='cuda'
+)
+# Result is strictly sparse (ReLU activated)
+```
+
+### 4. Expert Routing (MaxScore)
+
+Capacity-constrained routing for MoE (Mixture of Experts). Ensures experts are balanced.
+
+```python
+from efficient_linear_assignment import max_score_routing
+
+# logits: (B, Tokens, Experts)
+logits = torch.randn(1, 1024, 8, device='cuda')
+
+# Returns Normalized Probabilities (B, Tokens, Experts)
+scores = max_score_routing(
+    logits,
+    capacity_factor=1.0,
+    backend='triton'
+)
 ```
 
 ### Input Constraints & Padded Inputs
