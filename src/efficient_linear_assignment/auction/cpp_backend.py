@@ -1,6 +1,6 @@
 import torch
 from typing import Tuple
-from .backend_torch import AuctionTorch
+from .torch_backend import AuctionTorch
 
 # Try import extension
 HAS_CPP = False

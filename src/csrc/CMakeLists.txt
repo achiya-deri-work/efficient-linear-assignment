@@ -3,6 +3,8 @@
 python_add_library(efficient_linear_assignment_cpp MODULE
     interface.cpp
     kernels.cu
+    sinkhorn.cu
+    dual_ascent.cu
 )
 
 # Link against Torch and Python

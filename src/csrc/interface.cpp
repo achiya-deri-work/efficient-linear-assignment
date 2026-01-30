@@ -1,11 +1,22 @@
 #include <torch/extension.h>
 
-// Declare external function from kernels.cu
-std::vector<torch::Tensor> solve_auction_cuda(
-    torch::Tensor cost_matrix,
-    double epsilon,
-    int max_iter,
-    bool persistent_mode
+// Declarations
+std::vector<torch::Tensor> solve_auction_cuda(torch::Tensor cost_matrix, float epsilon, int max_iter, bool use_persistent);
+
+std::vector<torch::Tensor> sinkhorn_cuda_forward(
+    torch::Tensor C,
+    torch::Tensor log_mu,
+    torch::Tensor log_nu,
+    float epsilon,
+    int max_iter
+);
+
+std::vector<torch::Tensor> dual_ascent_cuda_forward(
+    torch::Tensor C,
+    torch::Tensor mu,
+    torch::Tensor nu,
+    float epsilon,
+    int max_iter
 );
 
 void launch_bid_kernel_cuda(
@@ -28,14 +39,11 @@ void compute_bids(
     launch_bid_kernel_cuda(benefits, prices, assignment, best_idx, increments, epsilon);
 }
 
-// Wrapper for solve
-std::vector<torch::Tensor> solve_wrapper(torch::Tensor cost, double epsilon, int max_iter, bool persistent_mode) {
-    return solve_auction_cuda(cost, epsilon, max_iter, persistent_mode);
-}
-
 PYBIND11_MODULE(efficient_linear_assignment_cpp, m) {
     m.doc() = "Efficient Linear Assignment C++ Backend";
     m.def("compute_bids", &compute_bids, "Compute Bids (CUDA)");
-    m.def("solve_auction_cuda", &solve_wrapper, "Solve Auction (Pure C++)",
-          py::arg("cost"), py::arg("epsilon"), py::arg("max_iter"), py::arg("persistent_mode") = false);
+    m.def("solve_auction_cuda", &solve_auction_cuda, "Solve Auction Algorithm (CUDA)",
+          py::arg("cost"), py::arg("epsilon"), py::arg("max_iter"), py::arg("use_persistent") = false);
+    m.def("sinkhorn_cuda_forward", &sinkhorn_cuda_forward, "Sinkhorn Persistent (CUDA)");
+    m.def("dual_ascent_cuda_forward", &dual_ascent_cuda_forward, "Dual Ascent Persistent (CUDA)");
 }

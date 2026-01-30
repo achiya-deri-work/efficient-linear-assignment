@@ -2,6 +2,7 @@
 #include <torch/types.h>
 #include <cub/cub.cuh>
 #include <cooperative_groups.h>
+#include "common.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -30,36 +31,6 @@ __device__ __forceinline__ void unpack_bid(unsigned long long packed, float* pri
     *price = ordered_int_to_float(p_bits);
     *agent_id = static_cast<int>(packed & 0xFFFFFFFF);
 }
-
-// ------------------------------------------------------------------
-// Helper: Global Barrier
-// ------------------------------------------------------------------
-struct GlobalBarrier {
-    volatile unsigned int* count;
-    volatile unsigned int* sense;
-    int expected_blocks;
-
-    __device__ void sync() {
-        // Only thread 0 of each block participates in the global barrier
-        if (threadIdx.x == 0) {
-            unsigned int my_sense = atomicAdd((unsigned int*)sense, 0); // Read current
-            // Atomic Inc
-            unsigned int old_count = atomicAdd((unsigned int*)count, 1);
-            if (old_count == expected_blocks - 1) {
-                // Last block resets count and flips sense
-                atomicExch((unsigned int*)count, 0); 
-                __threadfence(); // Ensure count reset visible
-                atomicExch((unsigned int*)sense, 1 - my_sense);
-            } else {
-                // Wait for sense to flip
-                while (atomicAdd((unsigned int*)sense, 0) == my_sense) {
-                     __nanosleep(100); // Backoff
-                }
-            }
-        }
-        __syncthreads(); // Block sync so all threads wait for thread 0
-    }
-};
 
 // ------------------------------------------------------------------
 // Device Function: Match Bid (Single Agent)
@@ -477,7 +448,7 @@ void launch_bid_kernel_cuda(
 // Unified Entry Point
 std::vector<torch::Tensor> solve_auction_cuda(
     torch::Tensor cost_matrix,
-    double epsilon,
+    float epsilon,
     int max_iter,
     bool persistent_mode // New Flag
 ) {
@@ -507,7 +478,7 @@ std::vector<torch::Tensor> solve_auction_cuda(
         int device_id = benefits.get_device();
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, device_id);
-        int num_sms = prop.multiProcessorCount;
+        // int num_sms = prop.multiProcessorCount;
         
         // Init Barrier
         barrier_state = torch::zeros({2}, options.dtype(torch::kInt32));

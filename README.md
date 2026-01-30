@@ -122,6 +122,16 @@ _(Torch timings N<1024 are notably slow due to Python overhead in the iterative 
 | **`triton`** | OpenAI Triton Kernels      | Fast, readable.                               | **~5x Slower than C++** for small N. |
 | **`cpp`**    | **Proprietary C++ / CUDA** | **Fastest (<6ms)**. Async Persistent Kernels. | Requires build step.                 |
 
+## Contributing
+
+We are actively looking for contributors! If you're interested in high-performance GPU kernels, optimization, or differentiable algorithms, please feel free to open a PR or issue.
+
+Current areas of interest:
+
+- **BF16 Support for CUDA:** Implementing BFloat16 dispatch for CUDA kernels.
+- **Kernel Optimization:** Further tuning of tile sizes and memory access patterns.
+- **New Algorithms:** Implementing additional optimal transport or assignment algorithms.
+
 ## License
 
 [License Name]

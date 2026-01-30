@@ -1,6 +1,6 @@
 import torch
 from typing import Optional, Tuple
-from .backend_torch import AuctionTorch
+from .torch_backend import AuctionTorch
 
 # Dictionary to hold backend implementations. 
 # Populated by imports or explicit registration.
@@ -10,19 +10,19 @@ BACKENDS = {
 
 # Try importing other backends gracefully
 try:
-    from .backend_triton import AuctionTriton
+    from .triton_backend import AuctionTriton
     BACKENDS['triton'] = AuctionTriton
 except ImportError:
     pass
 
 try:
-    from .backend_cpp import AuctionCPPCCUDA
+    from .cpp_backend import AuctionCPPCCUDA
     BACKENDS['cpp'] = AuctionCPPCCUDA
 except ImportError:
     pass
 
 try:
-    from .backend_cutile import AuctionCuTile
+    from .cutile_backend import AuctionCuTile
     BACKENDS['cutile'] = AuctionCuTile
 except ImportError:
     pass
