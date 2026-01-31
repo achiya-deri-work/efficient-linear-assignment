@@ -51,7 +51,19 @@ class AuctionTorch:
         # Global Object Offsets: Object 'm' in batch 'b' has global ID 'b*M + m'
         # batch_obj_offsets = torch.arange(B, device=benefits.device).repeat_interleave(M) * M
         
+        
+        # Generator Check
+        current_epsilon = self.epsilon
+        is_generator = hasattr(self.epsilon, '__next__')
+
         for i in range(self.max_iter):
+            # 0. Update Epsilon
+            if is_generator:
+                try:
+                    current_epsilon = next(self.epsilon)
+                except StopIteration:
+                    pass # Keep last value or restart? Usually generators are infinite or long enough.
+            
             # 1. Identify unassigned agents (Global indices)
             unassigned_mask = (flat_assignment == -1)
             active_agent_indices = torch.nonzero(unassigned_mask).squeeze(1)
@@ -85,7 +97,7 @@ class AuctionTorch:
             best_obj_idx = top2_indices[:, 0]
             
             # Increment
-            increments = best_val - second_val + self.epsilon
+            increments = best_val - second_val + current_epsilon
             
             # 4. Update Prices (Conflict Resolution)
             # Each active agent wants to update 'best_obj_idx' in their batch.

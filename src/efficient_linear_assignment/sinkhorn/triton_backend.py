@@ -3,6 +3,17 @@ import triton
 import triton.language as tl
 from typing import Optional
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=4),
+    ],
+    key=['B', 'N', 'M'],
+)
 @triton.jit
 def _sinkhorn_update_kernel(
     C_ptr,           # (B, N, M)
@@ -149,12 +160,7 @@ def log_stabilized_sinkhorn_triton(
     # Optimal Block Size: Next Power of 2 of Inner Dim
     # If N, M <= 1024, use 1024?
     # Or just fixed block size.
-    BLOCK_SIZE = triton.next_power_of_2(max(N, M))
-    if BLOCK_SIZE < 128: BLOCK_SIZE = 128
-    # Triton limits block size? 128k threads? 
-    # Usually max 1024 or 2048 threads per block.
-    # If Dim > 2048, we need loop (implemented above).
-    BLOCK_SIZE = min(BLOCK_SIZE, 1024) 
+    # Strides
     
     # Strides
     stride_cb, stride_cn, stride_cm = C.stride()
@@ -175,7 +181,6 @@ def log_stabilized_sinkhorn_triton(
             log_mu.stride(0), log_mu.stride(1),
             epsilon,
             True, # is_row_update
-            BLOCK_SIZE=BLOCK_SIZE
         )
         
         # Col Update: g = log(nu) - LSE(M_eps + f)
@@ -191,7 +196,6 @@ def log_stabilized_sinkhorn_triton(
             log_nu.stride(0), log_nu.stride(1),
             epsilon,
             False, # is_row_update
-            BLOCK_SIZE=BLOCK_SIZE
         )
         
     # Final Plan construction?

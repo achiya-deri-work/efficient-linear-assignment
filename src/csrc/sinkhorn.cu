@@ -188,7 +188,7 @@ std::vector<torch::Tensor> sinkhorn_cuda_forward(
     // Launch
     int block_size = 256;
     
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(C.scalar_type(), "sinkhorn_persistent", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BFLOAT16(C.scalar_type(), "sinkhorn_persistent", ([&] {
         sinkhorn_persistent_kernel<scalar_t><<<grid_size, block_size>>>(
             C.data_ptr<scalar_t>(),
             log_mu.data_ptr<scalar_t>(),

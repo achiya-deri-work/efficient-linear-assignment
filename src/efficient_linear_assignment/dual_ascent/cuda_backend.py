@@ -1,8 +1,6 @@
 import torch
-from efficient_linear_assignment.auction.cpp_backend import efficient_linear_assignment_cpp
-
-if not hasattr(efficient_linear_assignment_cpp, 'dual_ascent_cuda_forward'):
-    raise ImportError("Dual Ascent CUDA kernel not found in extension.")
+# Defer import to avoid circular dependency
+efficient_linear_assignment_cpp = None
 
 def l2_regularized_dual_ascent_cuda(
     C: torch.Tensor,
@@ -20,6 +18,13 @@ def l2_regularized_dual_ascent_cuda(
     if nu is None: nu = torch.ones(B, M, device=device) / M
     
     # Returns [alpha, beta]
+    global efficient_linear_assignment_cpp
+    if efficient_linear_assignment_cpp is None:
+        try:
+             import efficient_linear_assignment.efficient_linear_assignment_cpp as efficient_linear_assignment_cpp
+        except ImportError:
+             raise ImportError("Failed to import efficient_linear_assignment_cpp extension")
+
     alpha, beta = efficient_linear_assignment_cpp.dual_ascent_cuda_forward(
         C, mu, nu, epsilon, num_iters
     )

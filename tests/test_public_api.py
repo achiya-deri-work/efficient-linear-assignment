@@ -1,7 +1,7 @@
 import torch
 import pytest
 import scipy.optimize
-from efficient_linear_assignment.api import linear_assignment, BACKENDS
+from efficient_linear_assignment import linear_assignment, BACKENDS
 
 # Fixture to generate problems
 @pytest.fixture

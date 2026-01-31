@@ -5,6 +5,17 @@
 
 namespace cg = cooperative_groups;
 
+#ifndef AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BFLOAT16
+#define AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BFLOAT16(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH( \
+      TYPE, NAME, \
+      AT_DISPATCH_CASE(at::ScalarType::Double,  [&] { typedef double scalar_t; __VA_ARGS__(); }) \
+      AT_DISPATCH_CASE(at::ScalarType::Float,   [&] { typedef float scalar_t; __VA_ARGS__(); }) \
+      AT_DISPATCH_CASE(at::ScalarType::Half,    [&] { typedef c10::Half scalar_t; __VA_ARGS__(); }) \
+      AT_DISPATCH_CASE(at::ScalarType::BFloat16,[&] { typedef c10::BFloat16 scalar_t; __VA_ARGS__(); }) \
+  )
+#endif
+
 // ----------------------------------------------------------------------
 // Global Barrier for Persistent Kernels
 // ----------------------------------------------------------------------

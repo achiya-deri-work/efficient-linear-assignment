@@ -1,58 +1,44 @@
-# Architecture Overview
+# Efficient Linear Assignment: System Architecture
 
-`efficient-linear-assignment` is a high-performance, differentiable solver for the Linear Assignment Problem (LAP) using the **Auction Algorithm**. It is designed to scale efficiently on GPUs, handling batched inputs with thousands of agents ($N$) and objects ($M$).
+## 1. High-Level Design
 
-## 1. Core Algorithm: The Auction Method
-The solver uses the iterative Auction Algorithm with $\epsilon$-scaling.
-*   **Forward Pass**: Agents "bid" on objects that offer the highest net benefit ($Benefit - Price$). Objects are assigned to the highest bidder, and their prices increase. This repeats until all agents are assigned or convergence criteria are met.
-*   **Backward Pass**: Gradients are estimated via Implicit Maximum Likelihood Estimation (IMLE), allowing integration into end-to-end training pipelines.
+The library is designed as a **Multi-Backend, High-Performance Solver Suite** for Differentiable Linear Assignment. It decouples the _Algorithm_ (Sinkhorn, Dual Ascent, Auction) from the _Execution Engine_ (Torch, Triton, CUDA/Cutlass).
 
-## 2. System Components
+### System Layers
 
-### Frontend (`api.py`)
-*   **Entry Point**: `linear_assignment(cost_matrix)`.
-*   **Responsibilities**:
-    *   Input Validation: Enforces $N, M$ are multiples of 8.
-    *   Batch Handling: Supports `(B, N, M)` or `(N, M)` inputs.
-    *   Autograd Interface: Wraps the solver in `torch.autograd.Function`.
+1.  **Frontend (`api.py`)**: Unified entry points (`log_stabilized_sinkhorn`, etc.). Handles input validation and backend dispatch.
+2.  **Dispatch Layer (`compiled.py`)**: Smart caching and JIT compilation using `torch.compile` on Inductor.
+3.  **Kernel Layer**:
+    - **Torch/Inductor**: Fused CUDA kernels generated at runtime.
+    - **Triton**: Block-based custom kernels for specific layouts.
+    - **Native CUDA/Cutlass**: Pre-compiled C++ binaries for maximum architectural control.
 
-### Backends
-The library implements three pluggable backends, selectable via `backend=...`:
+## 2. Core Algorithms
 
-1.  **Torch Backend (`backend='torch'`)**
-    *   **Implementation**: Pure PyTorch operations (vectorized).
-    *   **Use Case**: Debugging, CPU fallback, reference implementation.
-    *   **Strategy**: Uses `torch.topk` for bids and `scatter_reduce_` for price updates.
+Detailed architecture for each solver is documented separately:
 
-2.  **Triton Backend (`backend='triton'`)**
-    *   **Implementation**: Custom Triton kernels for the "Bidding Phase".
-    *   **Performance**: High throughput for large matrices.
-    *   **Kernel**: `auction_bid_kernel` computes top-2 benefits per agent in parallel using block-level reductions.
+- **[Sinkhorn Architecture](architecture/sinkhorn.md)**: Fast, differentiable approximation using Log-Sum-Exp row/col balancing.
+- **[Dual Ascent Architecture](architecture/dual_ascent.md)**: Sparse, L2-regularized solver using Newton Coordinate Descent.
+- **[Auction Architecture](architecture/auction.md)**: Exact solver using iterative bidding, optimized with Block-Parallel CUDA kernels.
 
-3.  **C++/CUDA Backend (`backend='cpp'`)**
-    *   **Implementation**: Optimized CUDA `.cu` kernels interfaced via PyTorch C++ Extension.
-    *   **Performance**: Maximal control, using CUB-style warp primitives for reduction.
-    *   **Dispatch**: Supports dynamic dispatch for FP32 and FP16 types.
+## 3. Key Optimization Patterns
 
-## 3. Mixed Precision Strategy (Optimization)
-To maximize GPU throughput while maintaining numerical correctness, the library employs a split-precision strategy:
-*   **Data Transfer (Float16)**: The input `cost_matrix` is expected/allowed to be `Float16` (Half). This halves the PCIe and Global Memory bandwidth required to load the problem data.
-*   **Computation (Float32)**: Internally, all solvers cast inputs to `Float32` before performing arithmetic.
-    *   **Why?**: The Auction Algorithm relies on small $\epsilon$ increments. FP16 lacks the mantissa precision to accumulate small price updates over thousands of iterations without stalling (vanishing updates).
-    *   **Implementation**:
-        *   **C++**: `match_bid_kernel` accepts `Half*` benefits but explicitly casts to `float` for local accumulators and operations.
-        *   **Triton**: Kernels load with `.to(tl.float32)`.
+### A. The "Compiled Dispatcher" (`compiled.py`)
 
-## 4. Robustness & Conflict Resolution
-A critical challenge in parallel auction algorithms is handling **Degenerate Cases** (e.g., flat or zero cost matrices), which cause infinite loops or invalid assignments due to contention.
+To solve the `torch.compile` "Recompile Limit" instability, we implemented a custom dispatcher:
 
-**Our Solution: Strict Collision Resolution**
-*   **Logic**: During the update phase, if multiple agents bid effectively the same price (within tolerance) for the same object, the solver performs a strict "Election":
-    1.  Scatter Agent IDs to a temporary `winners` buffer at the target object index.
-    2.  Read back the winner ID.
-    3.  Only the Agent who "won" the write is marked as assigned. Others remain unassigned and must bid again.
-*   **Result**: Guarantees valid permutations (1-to-1 mapping) even when cost surfaces are completely flat.
+- **Shape-Specialization**: Creating a fresh function closure for every unique input shape $(B, N, M)$ ensures Inductor optimizes exactly for that size (unrolling loops, fusing constants).
+- **Nested Compile Region**: Iterative loops are separated from the inner step. `step = torch.compile(inner)` allows the compiler to fuse the heavy lifting (reductions) without unrolling the entire loop body, keeping compilation times low (<500ms).
 
-## 5. Current Bottlenecks (See Optimization Plan)
-The current architecture follows a "Ping-Pong" pattern where the GPU computes bids, and the CPU (Python) manages the loop control and updates.
-*   See `architecture_optimization_plan.md` for the roadmap to "Persistent Kernels" and "Atomic Updates" to move the full loop to the GPU.
+### B. Mixed Precision & TF32
+
+- **TF32 (TensorFloat-32)**: Globally enabled for Ampere+ GPUs. Allows FP32 operations to run at near-FP16 speeds by sacrificing mantissa precision, which is acceptable for Transport algorithms.
+- **FP16/BF16 Support**: Kernels support Half precision for storage/transfer, casting to Float32 for critical accumulation steps to prevents underflow in Iterative updates.
+
+### C. CUDA vs Torch
+
+Our benchmarks (Phase 7) concluded that **Torch Compiled** is often the superior backend for general use:
+
+- **Zero-Overhead**: No Python-to-C++ dispatch latency.
+- **Fusion**: Inductor fuses `Exp -> Sum -> Div` chains better than manual CUDA unless highly tuned.
+- **Use Case**: Use `compiled` for $N < 4096$. Use `cutlass` for extreme scales where manual memory coalescing outperforms the compiler.

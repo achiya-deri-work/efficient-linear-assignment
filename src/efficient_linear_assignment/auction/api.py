@@ -39,8 +39,43 @@ try:
             indices = solve_auction_cutlass(cost_matrix, self.epsilon, self.max_iter)
             return indices, None # No prices for now
     BACKENDS['cutlass'] = AuctionCutlass
+    BACKENDS['cutlass'] = AuctionCutlass
 except ImportError:
     pass
+
+try:
+    from .implicit_backend import AuctionImplicitTriton
+    BACKENDS['triton_implicit'] = AuctionImplicitTriton
+except ImportError:
+    pass
+
+def linear_assignment_implicit(
+    Q: torch.Tensor, 
+    K: torch.Tensor, 
+    epsilon: float = 1e-2, 
+    max_iter: int = 1000
+) -> torch.Tensor:
+    """
+    Solves Linear Assignment for Cost[i,j] = - (Q[i] @ K[j].T).
+    Equivalently, Maximizes Benefit[i,j] = Q[i] @ K[j].T.
+    
+    Args:
+        Q: (B, N, D) Source embeddings
+        K: (B, M, D) Target embeddings
+        epsilon: Epsilon for Auction scaling.
+        max_iter: Max iterations.
+        
+    Returns:
+        indices: (B, N) Tensor of assigned indices.
+    """
+    if 'triton_implicit' not in BACKENDS:
+         raise RuntimeError("Triton Implicit backend not available/installed.")
+         
+    solver = BACKENDS['triton_implicit'](epsilon, max_iter)
+    # solver.solve returns (assignment, prices)
+    assignment, _ = solver.solve(Q, K)
+    
+    return assignment.int()
 
 # Alias 'cuda' to 'cpp' for legacy support
 if 'cpp' in BACKENDS:

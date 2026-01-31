@@ -1,6 +1,6 @@
 import torch
 import pytest
-from efficient_linear_assignment.api import linear_assignment
+from efficient_linear_assignment import linear_assignment
 
 def test_compile_torch_backend():
     if not torch.cuda.is_available():

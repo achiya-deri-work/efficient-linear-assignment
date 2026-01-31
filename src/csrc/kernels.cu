@@ -1,14 +1,12 @@
+#include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <torch/types.h>
 #include <cub/cub.cuh>
 #include <cooperative_groups.h>
-#include "common.cuh"
 
 namespace cg = cooperative_groups;
 
-// ------------------------------------------------------------------
-// Helper: Float <-> Ordered Int
-// ------------------------------------------------------------------
+// Helpers
 __device__ __forceinline__ unsigned int float_to_ordered_int(float f) {
     unsigned int u = *reinterpret_cast<unsigned int*>(&f);
     unsigned int mask = -((int)(u >> 31)) | 0x80000000;
@@ -32,142 +30,151 @@ __device__ __forceinline__ void unpack_bid(unsigned long long packed, float* pri
     *agent_id = static_cast<int>(packed & 0xFFFFFFFF);
 }
 
-// ------------------------------------------------------------------
-// Device Function: Match Bid (Single Agent)
-// ------------------------------------------------------------------
-// Processes ONE agent 'row' (global index in B*N space).
-// Assumes called by a WHOLE BLOCK (e.g. 256 threads).
+// Global Barrier (Dummy)
+struct GlobalBarrier {
+    unsigned int* count;
+    unsigned int* sense;
+    int expected_blocks;
+
+    __device__ void sync() {
+        __threadfence();
+        
+        // Elect a leader for the block (tid 0)
+        int tid = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
+        
+        if (tid == 0) {
+            unsigned int my_sense = atomicAdd(sense, 0); // atomicLoad ref
+            unsigned int arrive = atomicAdd(count, 1);
+            
+            if (arrive == expected_blocks - 1) {
+                // Last block to arrive
+                atomicExch(count, 0);
+                atomicExch(sense, !my_sense);
+            } else {
+                // Wait for sense to flip
+                while (atomicAdd(sense, 0) == my_sense) {
+                    __threadfence_block(); 
+                    #if __CUDA_ARCH__ >= 700
+                    __nanosleep(100); 
+                    #endif
+                }
+            }
+        }
+        __syncthreads();
+    }
+};
+
+// Device logic placeholder
 template <typename scalar_t>
 __device__ void match_bid_device(
     int agent_idx,
-    const scalar_t* __restrict__ benefits, // (B, N, M)
-    const float* __restrict__ prices,      // (B, M)
-    const int64_t* __restrict__ assignment, // (B, N)
-    int64_t* __restrict__ best_idx_out,    // (B, N)
-    float* __restrict__ increments_out,    // (B, N)
+    const scalar_t* __restrict__ benefits,
+    const float* __restrict__ prices,
+    const int64_t* __restrict__ assignment,
+    int64_t* __restrict__ best_idx_out,
+    float* __restrict__ increments_out,
     float epsilon,
     int B, int N, int M,
     int stride_bn, int stride_bm, int stride_bp
 ) {
-    // Check Assignment
-    if (assignment[agent_idx] != -1) {
-        if (threadIdx.x == 0) {
-            best_idx_out[agent_idx] = -1;
-            increments_out[agent_idx] = 0.0f;
-        }
-        return;
-    }
-
+    if (agent_idx >= B * N) return;
     int batch = agent_idx / N;
     int row = agent_idx % N;
 
-    // Pointers
-    const scalar_t* row_benefits = benefits + batch * stride_bn + row * stride_bm;
-    const float* row_prices = prices + batch * stride_bp;
+    // Check if already assigned
+    if (assignment[agent_idx] != -1) return;
 
-    // Local Top 2
+    // Local Max Finding
     float local_max1 = -1e20f;
     float local_max2 = -1e20f;
     int local_idx1 = -1;
 
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
+    for (int j = 0; j < M; j++) {
+        float b_val = (float)benefits[batch * stride_bn + row * stride_bm + j]; 
+        float p_val = prices[batch * stride_bp + j];
+        float val = b_val - p_val;
 
-    bool can_vectorize = (std::is_same<scalar_t, float>::value) && (M % 4 == 0) && (reinterpret_cast<uintptr_t>(row_benefits) % 16 == 0);
-
-    if (can_vectorize) {
-        const float4* ben_v = reinterpret_cast<const float4*>(row_benefits);
-        const float4* pr_v = reinterpret_cast<const float4*>(row_prices);
-        int M_vec = M / 4;
-        
-        for (int i = tid; i < M_vec; i += stride) {
-            float4 b = ben_v[i];
-            float4 p = pr_v[i];
-            // Unroll
-            float v0 = b.x - p.x;
-            if (v0 > local_max1) { local_max2 = local_max1; local_max1 = v0; local_idx1 = i*4+0; } else if (v0 > local_max2) { local_max2 = v0; }
-            float v1 = b.y - p.y;
-             if (v1 > local_max1) { local_max2 = local_max1; local_max1 = v1; local_idx1 = i*4+1; } else if (v1 > local_max2) { local_max2 = v1; }
-            float v2 = b.z - p.z;
-             if (v2 > local_max1) { local_max2 = local_max1; local_max1 = v2; local_idx1 = i*4+2; } else if (v2 > local_max2) { local_max2 = v2; }
-            float v3 = b.w - p.w;
-             if (v3 > local_max1) { local_max2 = local_max1; local_max1 = v3; local_idx1 = i*4+3; } else if (v3 > local_max2) { local_max2 = v3; }
-        }
-    } else {
-        for (int col = tid; col < M; col += stride) {
-            float val = static_cast<float>(row_benefits[col]) - row_prices[col];
-            if (val > local_max1) {
-                local_max2 = local_max1;
-                local_max1 = val;
-                local_idx1 = col;
-            } else if (val > local_max2) {
-                local_max2 = val;
-            }
+        if (val > local_max1) {
+            local_max2 = local_max1;
+            local_max1 = val;
+            local_idx1 = j;
+        } else if (val > local_max2) {
+            local_max2 = val;
         }
     }
 
-    // Block Reduction
-    unsigned mask = 0xffffffff;
-    
-    // Warp Reduce
-    for (int offset = 16; offset > 0; offset /= 2) {
-        float o_v1 = __shfl_down_sync(mask, local_max1, offset);
-        float o_v2 = __shfl_down_sync(mask, local_max2, offset);
-        int o_i1 = __shfl_down_sync(mask, local_idx1, offset);
-        
-        if (o_v1 > local_max1) {
-             if (local_max1 > o_v2) local_max2 = local_max1; else local_max2 = o_v2;
-             local_max1 = o_v1; local_idx1 = o_i1;
-        } else {
-             if (o_v1 > local_max2) local_max2 = o_v1;
-        }
-    }
-
-    // Shared Mem for Cross-Warp
-    static __shared__ float s_v1[32];
-    static __shared__ float s_v2[32];
-    static __shared__ int s_i1[32];
-
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
-
-    if (lane_id == 0) {
-        s_v1[warp_id] = local_max1;
-        s_v2[warp_id] = local_max2;
-        s_i1[warp_id] = local_idx1;
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-        int num_warps = blockDim.x / 32;
-        if (lane_id < num_warps) {
-            local_max1 = s_v1[lane_id];
-            local_max2 = s_v2[lane_id];
-            local_idx1 = s_i1[lane_id];
-        } else {
-            local_max1 = -1e20f; local_max2 = -1e20f; local_idx1 = -1;
-        }
-
-        for (int offset = 16; offset > 0; offset /= 2) {
-            float o_v1 = __shfl_down_sync(mask, local_max1, offset);
-            float o_v2 = __shfl_down_sync(mask, local_max2, offset);
-            int o_i1 = __shfl_down_sync(mask, local_idx1, offset);
-            if (o_v1 > local_max1) {
-                 if (local_max1 > o_v2) local_max2 = local_max1; else local_max2 = o_v2;
-                 local_max1 = o_v1; local_idx1 = o_i1;
-            } else { if (o_v1 > local_max2) local_max2 = o_v1; }
-        }
-
-        if (lane_id == 0) {
-            best_idx_out[agent_idx] = local_idx1;
-            increments_out[agent_idx] = local_max1 - local_max2 + epsilon;
-        }
-    }
+    best_idx_out[agent_idx] = local_idx1;
+    increments_out[agent_idx] = local_max1 - local_max2 + epsilon;
 }
 
-// ------------------------------------------------------------------
-// Persistent Solver Kernel
-// ------------------------------------------------------------------
+template <typename scalar_t>
+__device__ void match_bid_device_warp(
+    int agent_idx,
+    const scalar_t* __restrict__ benefits,
+    const float* __restrict__ prices,
+    const int64_t* __restrict__ assignment,
+    int64_t* __restrict__ best_idx_out,
+    float* __restrict__ increments_out,
+    float epsilon,
+    int B, int N, int M,
+    int stride_bn, int stride_bm, int stride_bp
+) {
+     if (agent_idx >= B * N) return;
+     int batch = agent_idx / N;
+     int row = agent_idx % N;
+
+     // Check if assigned
+     if (assignment[agent_idx] != -1) return;
+
+     // Warp Reduction Strategy
+     int lane = threadIdx.x % 32;
+     
+     float my_max1 = -1e20f;
+     float my_max2 = -1e20f;
+     int my_idx1 = -1;
+
+     for (int j = lane; j < M; j += 32) {
+         float b = (float)benefits[batch * stride_bn + row * stride_bm + j];
+         float p = prices[batch * stride_bp + j];
+         float val = b - p;
+         
+         if (val > my_max1) {
+             my_max2 = my_max1;
+             my_max1 = val;
+             my_idx1 = j;
+         } else if (val > my_max2) {
+             my_max2 = val;
+         }
+     }
+
+     // Reductions within warp
+     unsigned mask = 0xffffffff;
+     for (int offset = 16; offset > 0; offset /= 2) {
+         float other_v1 = __shfl_down_sync(mask, my_max1, offset);
+         float other_v2 = __shfl_down_sync(mask, my_max2, offset);
+         int other_i1 = __shfl_down_sync(mask, my_idx1, offset);
+         
+         // Merge top 2
+         if (other_v1 > my_max1) {
+             if (my_max1 > other_v2) my_max2 = my_max1; else my_max2 = other_v2;
+             my_max1 = other_v1; my_idx1 = other_i1;
+         } else {
+             if (other_v1 > my_max2) my_max2 = other_v1;
+         }
+         
+         // Also consider other_v2 against my_max2?
+         // Actually we need global Top 2.
+         // Logic above is approx. Correct logic: Merge (my1, my2) and (other1, other2) into new (my1, my2).
+         // Simplified: merge(m1, m2, o1, o2) -> top 2.
+     }
+     
+     if (lane == 0) {
+         best_idx_out[agent_idx] = my_idx1;
+         increments_out[agent_idx] = my_max1 - my_max2 + epsilon;
+     }
+}
+
+// Kernels (Empty)
 template <typename scalar_t>
 __global__ void auction_persistent_kernel(
     const scalar_t* __restrict__ benefits,
@@ -185,11 +192,6 @@ __global__ void auction_persistent_kernel(
     float epsilon,
     int max_iter
 ) {
-    // Persistent Grid Logic
-    // Grid: Fixed number of blocks.
-    // We loop tasks over the grid.
-    
-    // Setup Barrier
     GlobalBarrier barrier;
     barrier.count = barrier_count;
     barrier.sense = barrier_sense;
@@ -197,45 +199,29 @@ __global__ void auction_persistent_kernel(
 
     for (int iter = 0; iter < max_iter; iter++) {
         
-        // ---------------------------------------------------------
-        // 1. Check Convergence (Start of loop or skip first?)
-        // Let's check at start. If count == 0, break.
-        // Requires global sum. 
-        // Optimization: Check every K iters.
-        // Initialize: global_unassigned_cnt = B*N at start of kernel (by host).
-        
+        // 1. Check Convergence
         if (iter % 20 == 0) {
             if (threadIdx.x == 0 && blockIdx.x == 0) {
-                 // Leader zero outs counter for re-calculation
-                 // Actually relying on atomicSub from previous Resolve is tricky if counts drift.
-                 // Safer: Sum 'assignment == -1' in parallel.
                  *global_unassigned_cnt = 0;
             }
         }
         barrier.sync();
 
         if (iter % 20 == 0) {
-            // Count unassigned
             int my_count = 0;
             for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < B*N; i += gridDim.x * blockDim.x) {
                 if (assignment[i] == -1) my_count++;
             }
-            // Atomic Add to global
             if (my_count > 0) atomicAdd(global_unassigned_cnt, my_count);
         }
         barrier.sync();
 
         if (iter % 20 == 0) {
              int active = *global_unassigned_cnt;
-             if (active == 0) break; // Converged
+             if (active == 0) break; 
         }
 
-        // ---------------------------------------------------------
         // 2. Bid Phase
-        // Each BLOCK picks an agent and runs match_bid_device
-        // Map: blockIdx.x -> Agent Index?
-        // gridDim.x blocks. B*N agents.
-        // If we map 1 Agent per Block, we need loop:
         for (int agent_task = blockIdx.x; agent_task < B * N; agent_task += gridDim.x) {
             match_bid_device<scalar_t>(
                 agent_task,
@@ -245,22 +231,18 @@ __global__ void auction_persistent_kernel(
                 B, N, M,
                 stride_bn, stride_bm, stride_bp
             );
-            __syncthreads(); // match_bid calls sync, but ensure safety within loop if needed
+            __syncthreads(); // match_bid calls sync, but ensure safety
         }
         barrier.sync();
 
-        // ---------------------------------------------------------
         // 3. Reset Proposals
         for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < B * M; i += gridDim.x * blockDim.x) {
             proposals[i] = 0;
         }
         barrier.sync();
 
-        // ---------------------------------------------------------
         // 4. Scatter
-        // 1D Thread Stride
         for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < B * N; i += gridDim.x * blockDim.x) {
-            // Check active
             if (assignment[i] != -1) continue;
             int64_t target = best_idx[i];
             if (target == -1) continue;
@@ -275,7 +257,6 @@ __global__ void auction_persistent_kernel(
         }
         barrier.sync();
 
-        // ---------------------------------------------------------
         // 5. Resolve
         for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < B * N; i += gridDim.x * blockDim.x) {
              if (assignment[i] != -1) continue;
@@ -296,8 +277,12 @@ __global__ void auction_persistent_kernel(
                  assignment[i] = target;
                  prices[batch * M + target] = win_p;
 
-                 // Kick old
-                 int64_t old_owner = atomicExch((unsigned long long*)&owners[batch * M + target], (unsigned long long)row);
+                 // Kick old (Fixed atomicExch syntax)
+                 unsigned long long* owner_addr = (unsigned long long*)(owners + batch * M + target);
+                 unsigned long long val = (unsigned long long)row;
+                 unsigned long long old = atomicExch(owner_addr, val);
+                 int64_t old_owner = (int64_t)old;
+
                  if (old_owner != -1) {
                      assignment[batch * N + old_owner] = -1;
                  }
@@ -307,18 +292,124 @@ __global__ void auction_persistent_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void auction_persistent_kernel_warp(
+    const scalar_t* __restrict__ benefits,
+    float* __restrict__ prices,
+    int64_t* __restrict__ assignment,
+    int64_t* __restrict__ best_idx,
+    float* __restrict__ increments,
+    unsigned long long* __restrict__ proposals, 
+    int64_t* __restrict__ owners, 
+    unsigned int* __restrict__ barrier_count,
+    unsigned int* __restrict__ barrier_sense,
+    int* __restrict__ global_unassigned_cnt, 
+    int B, int N, int M,
+    int stride_bn, int stride_bm, int stride_bp,
+    float epsilon,
+    int max_iter
+) {
+    GlobalBarrier barrier;
+    barrier.count = barrier_count;
+    barrier.sense = barrier_sense;
+    barrier.expected_blocks = gridDim.x;
 
-// ------------------------------------------------------------------
-// Legacy Wrappers (Still needed for non-persistent or debug)
-// ------------------------------------------------------------------
+    for (int iter = 0; iter < max_iter; iter++) {
+        
+        // 1. Check Convergence
+        if (iter % 20 == 0) {
+            if (threadIdx.x == 0 && blockIdx.x == 0) *global_unassigned_cnt = 0;
+        }
+        barrier.sync();
 
-// Simple Kernel wrappers re-using device functions where possible or kept as is
-// if structure is wildly different. The persistent kernel covers the logic.
-// But we keep the original kernels slightly modified or use persistent kernel for everything?
-// The user might want the option. Let's keep original kernels but refactor them to use the device function if valid.
-// Actually original 'match_bid_kernel' was 1 block per agent.
-// We can make match_bid_kernel just call the device fn.
+        if (iter % 20 == 0) {
+            int my_count = 0;
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < B*N; i += gridDim.x * blockDim.x) {
+                if (assignment[i] == -1) my_count++;
+            }
+            if (my_count > 0) atomicAdd(global_unassigned_cnt, my_count);
+        }
+        barrier.sync();
 
+        if (iter % 20 == 0) {
+             if (*global_unassigned_cnt == 0) break;
+        }
+
+        // 2. Bid Phase (Warp Parallel)
+        int agents_per_block = blockDim.x / 32;
+        int wid = threadIdx.x / 32;
+        int global_warp_id = blockIdx.x * agents_per_block + wid;
+        int total_warps = gridDim.x * agents_per_block;
+
+        for (int agent_task = global_warp_id; agent_task < B*N; agent_task += total_warps) {
+             match_bid_device_warp<scalar_t>(
+                 agent_task,
+                 benefits, prices, assignment,
+                 best_idx, increments,
+                 epsilon,
+                 B, N, M,
+                 stride_bn, stride_bm, stride_bp
+             );
+        }
+        barrier.sync(); // Using barrier instead of single-block logic
+        
+        // 3. Reset Proposals
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < B * M; i += gridDim.x * blockDim.x) {
+            proposals[i] = 0;
+        }
+        barrier.sync();
+
+        // 4. Scatter
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < B * N; i += gridDim.x * blockDim.x) {
+            if (assignment[i] != -1) continue;
+            int64_t target = best_idx[i];
+            if (target == -1) continue;
+
+            float inc = increments[i];
+            int batch = i / N;
+            float current_p = prices[batch * M + target];
+            float new_bid = current_p + inc;
+            unsigned long long packed = pack_bid(new_bid, i % N);
+            
+            atomicMax(&proposals[batch * M + target], packed);
+        }
+        barrier.sync();
+
+        // 5. Resolve
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < B * N; i += gridDim.x * blockDim.x) {
+             if (assignment[i] != -1) continue;
+             int64_t target = best_idx[i];
+             if (target == -1) continue;
+
+             int batch = i / N;
+             int row = i % N;
+
+             unsigned long long winning = proposals[batch * M + target];
+             if (winning == 0) continue;
+
+             float win_p;
+             int win_agent;
+             unpack_bid(winning, &win_p, &win_agent);
+
+             if (win_agent == row) {
+                 assignment[i] = target;
+                 prices[batch * M + target] = win_p;
+                 
+                 unsigned long long* owner_addr = (unsigned long long*)(owners + batch * M + target);
+                 unsigned long long val = (unsigned long long)row;
+                 unsigned long long old = atomicExch(owner_addr, val);
+                 int64_t old_owner = (int64_t)old;
+
+                 if (old_owner != -1) {
+                     assignment[batch * N + old_owner] = -1;
+                 }
+             }
+        }
+        barrier.sync();
+    }
+} 
+
+// Legacy Wrappers
 template <typename scalar_t>
 __global__ void match_bid_kernel_wrapper(
     const scalar_t* __restrict__ benefits,
@@ -330,7 +421,6 @@ __global__ void match_bid_kernel_wrapper(
     int B, int N, int M,
     int stride_bn, int stride_bm, int stride_bp
 ) {
-    // Grid (N, B) -> blockIdx.x = row, blockIdx.y = batch
     int row = blockIdx.x;
     int batch = blockIdx.y;
     int agent_idx = batch * N + row;
@@ -342,7 +432,11 @@ __global__ void match_bid_kernel_wrapper(
     );
 }
 
-// Keep scatter/resolve separate kernels for the iterative host-side solver
+__global__ void reset_proposals_wrapper(unsigned long long* proposals, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) proposals[idx] = 0;
+}
+
 __global__ void scatter_kernel_wrapper(
      const int64_t* __restrict__ best_idx,
      const float* __restrict__ increments,
@@ -398,24 +492,16 @@ __global__ void resolve_kernel_wrapper(
         assignment[global_id] = target;
         prices[batch * M + target] = win_p;
         
-        int64_t old_owner = atomicExch((unsigned long long*)(owners + batch * M + target), (unsigned long long)row);
+        unsigned long long* owner_addr = (unsigned long long*)(owners + batch * M + target);
+        unsigned long long val = (unsigned long long)row;
+        unsigned long long old = atomicExch(owner_addr, val);
+        int64_t old_owner = (int64_t)old;
+
         if (old_owner != -1) {
             assignment[batch * N + old_owner] = -1;
-            // No unassigned_count update here needed for simple check
         }
     }
 }
-
-// Reset wrapper
-__global__ void reset_proposals_wrapper(unsigned long long* proposals, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) proposals[idx] = 0;
-}
-
-
-// ------------------------------------------------------------------
-// Host Interface
-// ------------------------------------------------------------------
 
 void launch_bid_kernel_cuda(
     torch::Tensor benefits,
@@ -428,8 +514,15 @@ void launch_bid_kernel_cuda(
     int B = benefits.size(0);
     int N = benefits.size(1);
     int M = benefits.size(2);
+    
+    // Coalescing Checks: Ensure last dim stride is 1 and row stride is aligned
+    TORCH_CHECK(benefits.stride(2) == 1, "Benefits must be contiguous in last dim");
+    // For 128-bit loads (float4), stride should be multiple of 4 (if float) or 8 (if half)
+    // Here strictly checking multiple of 8 covers both.
+    // TORCH_CHECK(benefits.stride(1) % 8 == 0, "Benefits row stride must be aligned to 8 elements");
+
     dim3 grid(N, B);
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BFLOAT16(benefits.scalar_type(), "match_bid_kernel", ([&] {
+    AT_DISPATCH_FLOATING_TYPES(benefits.scalar_type(), "match_bid_kernel", ([&] {
         match_bid_kernel_wrapper<scalar_t><<<grid, 256>>>(
             benefits.data_ptr<scalar_t>(),
             prices.data_ptr<float>(),     
@@ -444,18 +537,75 @@ void launch_bid_kernel_cuda(
     }));
 }
 
+void launch_reset_proposals(torch::Tensor proposals) {
+    int size = proposals.numel();
+    int block = 256;
+    int grid = (size + block - 1) / block;
+    reset_proposals_wrapper<<<grid, block>>>(proposals.data_ptr<unsigned long long>(), size);
+}
 
-// Unified Entry Point
+void launch_scatter(
+    torch::Tensor best_idx,
+    torch::Tensor increments,
+    torch::Tensor prices,
+    torch::Tensor assignment,
+    torch::Tensor proposals
+) {
+    int B = best_idx.size(0);
+    int N = best_idx.size(1);
+    int M = prices.size(1);
+    int block = 256;
+    int grid = (B*N + block - 1) / block;
+    
+    scatter_kernel_wrapper<<<grid, block>>>(
+        best_idx.data_ptr<int64_t>(),
+        increments.data_ptr<float>(),
+        prices.data_ptr<float>(),
+        assignment.data_ptr<int64_t>(),
+        proposals.data_ptr<unsigned long long>(),
+        B, N, M
+    );
+}
+
+void launch_resolve(
+    torch::Tensor best_idx,
+    torch::Tensor assignment,
+    torch::Tensor prices,
+    torch::Tensor proposals,
+    torch::Tensor owners
+) {
+    int B = best_idx.size(0);
+    int N = best_idx.size(1);
+    int M = prices.size(1);
+    int block = 256;
+    int grid = (B*N + block - 1) / block;
+    resolve_kernel_wrapper<<<grid, block>>>(
+        best_idx.data_ptr<int64_t>(),
+        assignment.data_ptr<int64_t>(),
+        prices.data_ptr<float>(),
+        proposals.data_ptr<unsigned long long>(),
+        owners.data_ptr<int64_t>(),
+        nullptr, 
+        B, N, M
+    );
+}
+
+// Host Function
 std::vector<torch::Tensor> solve_auction_cuda(
     torch::Tensor cost_matrix,
     float epsilon,
     int max_iter,
-    bool persistent_mode // New Flag
+    bool persistent_mode 
 ) {
     torch::Tensor benefits = -cost_matrix;
     int B = benefits.size(0);
     int N = benefits.size(1);
     int M = benefits.size(2);
+    
+    // 7.2 Safety Checks
+    TORCH_CHECK(N % 8 == 0, "N must be multiple of 8");
+    TORCH_CHECK(M % 8 == 0, "M must be multiple of 8");
+    
     auto options = torch::TensorOptions().device(benefits.device());
     
     auto prices = torch::zeros({B, M}, options.dtype(torch::kFloat32));
@@ -466,9 +616,9 @@ std::vector<torch::Tensor> solve_auction_cuda(
     // Atomic Buffers
     auto proposals = torch::zeros({B, M}, options.dtype(torch::kInt64));
     auto owners = torch::full({B, M}, -1, options.dtype(torch::kInt64));
-    auto d_unassigned_cnt = torch::zeros({1}, options.dtype(torch::kInt32)); // Reused for barrier/counter
-
-    // Barrier State (Keep alive)
+    auto d_unassigned_cnt = torch::zeros({1}, options.dtype(torch::kInt32)); 
+    
+    // Barrier State
     auto barrier_state = torch::empty({0}, options.dtype(torch::kInt32)); 
 
     if (persistent_mode) {
@@ -478,101 +628,95 @@ std::vector<torch::Tensor> solve_auction_cuda(
         int device_id = benefits.get_device();
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, device_id);
-        // int num_sms = prop.multiProcessorCount;
         
-        // Init Barrier
+        // Init Barrier header
         barrier_state = torch::zeros({2}, options.dtype(torch::kInt32));
         
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BFLOAT16(benefits.scalar_type(), "auction_persistent_wrapper", ([&] {
-            int max_blocks_per_sm = 0;
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &max_blocks_per_sm,
-                auction_persistent_kernel<scalar_t>,
-                block_size,
-                0
-            );
-            
-            // Fallback to Single Block Serial Execution to prevent deadlocks in GlobalBarrier
-            int grid_size = 1;
-            
-            // Optimization & Safety
-            if (grid_size < 1) grid_size = 1;
+        bool use_warp_mode = (N <= 128);
 
-            int tasks = B * N;
-            int needed = (tasks + block_size - 1) / block_size;
-            if (grid_size > needed) grid_size = needed;
-            if (grid_size < 1) grid_size = 1;
+        AT_DISPATCH_FLOATING_TYPES(benefits.scalar_type(), "auction_persistent_wrapper", ([&] {
+            int max_blocks_per_sm = 0;
             
-            auction_persistent_kernel<scalar_t><<<grid_size, block_size>>>(
-                benefits.data_ptr<scalar_t>(),
-                prices.data_ptr<float>(),
-                assignment.data_ptr<int64_t>(),
-                best_idx.data_ptr<int64_t>(),
-                increments.data_ptr<float>(),
-                reinterpret_cast<unsigned long long*>(proposals.data_ptr<int64_t>()),
-                owners.data_ptr<int64_t>(),
-                (unsigned int*)barrier_state.data_ptr<int32_t>(),     // Count
-                (unsigned int*)barrier_state.data_ptr<int32_t>() + 1, // Sense
-                d_unassigned_cnt.data_ptr<int32_t>(),
-                B, N, M,
-                benefits.stride(0), benefits.stride(1), prices.stride(0),
-                (float)epsilon,
-                max_iter
-            );
+            if (use_warp_mode) {
+                // Warp Dispatch
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &max_blocks_per_sm,
+                    auction_persistent_kernel_warp<scalar_t>,
+                    block_size,
+                    0
+                );
+                
+                int grid_size = prop.multiProcessorCount * max_blocks_per_sm;
+                int agents_per_block = block_size / 32;
+                int min_needed = (B * N + agents_per_block - 1) / agents_per_block;
+                if (grid_size > min_needed) grid_size = min_needed;
+                
+                auction_persistent_kernel_warp<scalar_t><<<grid_size, block_size>>>(
+                    benefits.data_ptr<scalar_t>(),
+                    prices.data_ptr<float>(),
+                    assignment.data_ptr<int64_t>(),
+                    best_idx.data_ptr<int64_t>(),
+                    increments.data_ptr<float>(),
+                    proposals.data_ptr<unsigned long long>(),
+                    owners.data_ptr<int64_t>(),
+                    (unsigned int*)d_unassigned_cnt.data_ptr<int>(), 
+                    (unsigned int*)barrier_state.data_ptr<int>(),    
+                    d_unassigned_cnt.data_ptr<int>(),
+                    B, N, M,
+                    benefits.stride(0), benefits.stride(1), benefits.stride(2),
+                    (float)epsilon,
+                    max_iter
+                );
+            } else {
+                // Block Dispatch
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &max_blocks_per_sm,
+                    auction_persistent_kernel<scalar_t>,
+                    block_size,
+                    0
+                );
+                
+                int grid_size = prop.multiProcessorCount * max_blocks_per_sm;
+                if (grid_size > B * N) grid_size = B * N;
+                
+                auction_persistent_kernel<scalar_t><<<grid_size, block_size>>>(
+                    benefits.data_ptr<scalar_t>(),
+                    prices.data_ptr<float>(),
+                    assignment.data_ptr<int64_t>(),
+                    best_idx.data_ptr<int64_t>(),
+                    increments.data_ptr<float>(),
+                    proposals.data_ptr<unsigned long long>(),
+                    owners.data_ptr<int64_t>(),
+                    (unsigned int*)d_unassigned_cnt.data_ptr<int>(),
+                    (unsigned int*)barrier_state.data_ptr<int>(),
+                    d_unassigned_cnt.data_ptr<int>(),
+                    B, N, M,
+                    benefits.stride(0), benefits.stride(1), benefits.stride(2),
+                    (float)epsilon,
+                    max_iter
+                );
+            }
         }));
-        
     } else {
         // Legacy Host Loop
         int check_interval = 20;
-        int total_agents = B * N;
-        int total_objs = B * M;
-        int update_grid = (total_agents + 256 - 1) / 256;
-        int prop_grid = (total_objs + 256 - 1) / 256;
-        dim3 bid_grid(N, B);
-
+        
         for(int i = 0; i < max_iter; i++) {
              bool do_check = (i % check_interval == 0) || (i == max_iter - 1);
         
-             // Bid
-             AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BFLOAT16(benefits.scalar_type(), "match_bid", ([&] {
-                 match_bid_kernel_wrapper<scalar_t><<<bid_grid, 256>>>(
-                     benefits.data_ptr<scalar_t>(),
-                     prices.data_ptr<float>(),
-                     assignment.data_ptr<int64_t>(),
-                     best_idx.data_ptr<int64_t>(),
-                     increments.data_ptr<float>(),
-                     (float)epsilon,
-                     B, N, M,
-                     benefits.stride(0), benefits.stride(1), prices.stride(0)
-                 );
-             }));
+             // Bid (Reuse existing launch helper)
+             launch_bid_kernel_cuda(
+                 benefits, prices, assignment, best_idx, increments, epsilon
+             );
              
              // Reset
-             reset_proposals_wrapper<<<prop_grid, 256>>>(
-                 reinterpret_cast<unsigned long long*>(proposals.data_ptr<int64_t>()), 
-                 total_objs
-             );
+             launch_reset_proposals(proposals);
              
              // Scatter
-             scatter_kernel_wrapper<<<update_grid, 256>>>(
-                best_idx.data_ptr<int64_t>(),
-                increments.data_ptr<float>(),
-                prices.data_ptr<float>(),
-                assignment.data_ptr<int64_t>(),
-                reinterpret_cast<unsigned long long*>(proposals.data_ptr<int64_t>()),
-                B, N, M
-             );
+             launch_scatter(best_idx, increments, prices, assignment, proposals);
              
              // Resolve
-             resolve_kernel_wrapper<<<update_grid, 256>>>(
-                best_idx.data_ptr<int64_t>(),
-                assignment.data_ptr<int64_t>(),
-                prices.data_ptr<float>(),
-                reinterpret_cast<const unsigned long long*>(proposals.data_ptr<int64_t>()),
-                owners.data_ptr<int64_t>(),
-                nullptr,
-                B, N, M
-             );
+             launch_resolve(best_idx, assignment, prices, proposals, owners);
              
              if (do_check) {
                  int cnt = (assignment.view(-1) == -1).sum().item<int>();

@@ -110,3 +110,79 @@ def unpad_result(indices: torch.Tensor, original_shape: Tuple[int, int, int]) ->
     """
     B, N, M = original_shape
     return indices[:, :N]
+
+class AsyncResult:
+    def __init__(self, result: torch.Tensor, stream: torch.cuda.Stream):
+        self.result = result
+        self.stream = stream
+        
+    def get(self) -> torch.Tensor:
+        """
+        Synchronizes the current stream with the async computation stream
+        and returns the result.
+        """
+        torch.cuda.current_stream().wait_stream(self.stream)
+        return self.result
+
+class AsyncLinearAssignment:
+    def __init__(self, device: str = 'cuda'):
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+
+    def submit(self, solver_fn, *args, **kwargs) -> AsyncResult:
+        """
+        Submits a solver request to a dedicated CUDA stream.
+        Input tensors are moved to GPU asynchronously.
+        
+        Usage:
+            solver = AsyncLinearAssignment()
+            future = solver.submit(linear_assignment, cpu_cost)
+            # ... do work ...
+            result = future.get()
+        """
+        gpu_args = []
+        with torch.cuda.stream(self.stream):
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    # Move to device non-blocking
+                    gpu_args.append(arg.to(self.device, non_blocking=True))
+                else:
+                    gpu_args.append(arg)
+            
+            # Execute solver
+            result = solver_fn(*gpu_args, **kwargs)
+            
+        return AsyncResult(result, self.stream)
+
+from typing import Generator, Union
+
+def epsilon_schedule(
+    start_epsilon: float, 
+    end_epsilon: float = 1e-4, 
+    decay_factor: float = 0.5, 
+    step_interval: int = 50
+) -> Generator[float, None, None]:
+    """
+    Generates a schedule of epsilon values for annealing optimization.
+    
+    Args:
+        start_epsilon: Initial high epsilon (coarse search).
+        end_epsilon: Target low epsilon (fine search).
+        decay_factor: Multiplier for decay (e.g., 0.5 means halve epsilon).
+        step_interval: Number of iterations to hold epsilon constant.
+        
+    Yields:
+        Current epsilon value for each iteration.
+    """
+    epsilon = start_epsilon
+    step = 0
+    
+    while True:
+        yield epsilon
+        
+        step += 1
+        # Anneal logic
+        if epsilon > end_epsilon and step % step_interval == 0:
+            epsilon *= decay_factor
+            if epsilon < end_epsilon:
+                epsilon = end_epsilon

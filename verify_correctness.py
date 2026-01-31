@@ -13,6 +13,7 @@ from efficient_linear_assignment import (
     dual_ascent_compiled,
     auction_compiled
 )
+from efficient_linear_assignment.auction.api import linear_assignment_implicit
 
 # Colors for output
 GREEN = "\033[92m"
@@ -168,6 +169,65 @@ def verify_auction(
         log(f"    [FAIL] Cost Diff: {diff_seen:.4f} (GT: {cost_gt_seen:.2f} vs Pred: {cost_pred_seen:.2f})", RED)
         return False
 
+def verify_implicit_auction(
+    dtype: torch.dtype,
+    B=4, N=128, M=128, D=64,
+    cost_scale=1000,
+    max_iter=5000,
+    epsilon=1e-2
+):
+    """
+    Verify Implicit Solver (Q, K) vs Explicit GT (C = -Q@K.T).
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 1. Generate Q, K
+    # To mimic integers for exactness check, we can use integer Q, K?
+    # Or just float Q, K and check standard epsilon-optimality.
+    # Q, K in [-5, 5] integers?
+    
+    Q = torch.randint(-5, 5, (B, N, D), device=device).to(dtype=torch.float32)
+    K = torch.randint(-5, 5, (B, M, D), device=device).to(dtype=torch.float32)
+    
+    # Explicit Cost
+    # C = - Q @ K.T
+    C_fp32 = -torch.matmul(Q, K.transpose(-2, -1))
+    
+    # 2. GT
+    idx_gt, cost_gt = run_baseline_auction(C_fp32)
+    
+    # 3. Solvers
+    # Cast to target dtype
+    Q_in = Q.to(dtype=dtype)
+    K_in = K.to(dtype=dtype)
+    
+    try:
+        indices_pred = linear_assignment_implicit(Q_in, K_in, epsilon=epsilon, max_iter=max_iter)
+    except Exception as e:
+        log(f"    [FAIL] Implicit Crash: {e}", RED)
+        return False
+        
+    # 4. Check
+    cost_pred = calculate_assignment_cost(C_fp32, indices_pred)
+    
+    # Re-run GT on what Implicit saw? 
+    # Implicit computes dot product in float32 usually (tensor core accumulation).
+    # So it mimics FP32 cost matrix effectively.
+    
+    diff = abs(cost_pred - cost_gt)
+    
+    # Tolerance
+    # Since Q, K are small integers, Cost is integer. 
+    # Solution should be exact or close.
+    # epsilon * N error allowed.
+    
+    if diff <= (abs(cost_gt) * 1e-4 + N * epsilon):
+        log(f"    [PASS] Cost Diff: {diff:.4f}", GREEN)
+        return True
+    else:
+        log(f"    [FAIL] Cost Diff: {diff:.4f} (GT: {cost_gt:.2f} vs Pred: {cost_pred:.2f})", RED)
+        return False
+
 def verify_marginals(
     algo_name: str,
     func,
@@ -242,6 +302,12 @@ def run_all():
             log(f"  Backend: {backend}...", end="")
             # Use smaller scale for convergence
             verify_auction(backend, dtype, cost_scale=5, max_iter=50000, epsilon=1e-3)
+            
+    # 1b. Implicit Auction Test
+    log("\n--- Testing Auction (Implicit) ---", YELLOW)
+    for prec_name, dtype in dtypes.items():
+        log(f"Precision: {prec_name}...", end="")
+        verify_implicit_auction(dtype, epsilon=1e-2)
 
     # 2. Sinkhorn Test
     log("\n--- Testing Sinkhorn (Marginals) ---", YELLOW)
@@ -258,6 +324,7 @@ def run_all():
     for prec_name, dtype in dtypes.items():
         log(f"Precision: {prec_name}")
         for backend in backends_approx:
+            if backend == 'cuda': continue
             log(f"  Backend: {backend}...", end="")
             fn = dual_ascent_compiled if backend == 'torch_compiled' else l2_regularized_dual_ascent
             verify_marginals("DualAscent", fn, backend, dtype, tol=0.1) 

@@ -175,7 +175,7 @@ std::vector<torch::Tensor> dual_ascent_cuda_forward(
     
     int block_size = 256;
     
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(C.scalar_type(), "dual_ascent_persistent", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF_AND_BFLOAT16(C.scalar_type(), "dual_ascent_persistent", ([&] {
         dual_ascent_persistent_kernel<scalar_t><<<grid_size, block_size>>>(
             C.data_ptr<scalar_t>(),
             mu.data_ptr<scalar_t>(),

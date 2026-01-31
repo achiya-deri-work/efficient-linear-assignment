@@ -1,9 +1,6 @@
 import torch
-from efficient_linear_assignment.auction.cpp_backend import efficient_linear_assignment_cpp
-
-# Ensure extension is loaded
-if not hasattr(efficient_linear_assignment_cpp, 'sinkhorn_cuda_forward'):
-    raise ImportError("Sinkhorn CUDA kernel not found in efficient_linear_assignment_cpp. Rebuild extension.")
+# Defer import to avoid circular dependency and initialization order issues
+efficient_linear_assignment_cpp = None
 
 def log_stabilized_sinkhorn_cuda(
     C: torch.Tensor,
@@ -13,6 +10,13 @@ def log_stabilized_sinkhorn_cuda(
     num_iters: int = 20
 ) -> torch.Tensor:
     
+    global efficient_linear_assignment_cpp
+    if efficient_linear_assignment_cpp is None:
+        try:
+             import efficient_linear_assignment.efficient_linear_assignment_cpp as efficient_linear_assignment_cpp
+        except ImportError:
+             raise ImportError("Failed to import efficient_linear_assignment_cpp extension")
+
     if C.ndim == 2: C = C.unsqueeze(0)
     B, N, M = C.shape
     device = C.device

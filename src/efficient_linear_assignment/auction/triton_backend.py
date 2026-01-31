@@ -159,6 +159,21 @@ def find_top2_kernel(
 # Each block handles one row (Agent).
 # Threads load chunks of M, compute local top2, then reduce across threads.
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=4),
+    ],
+    key=['B', 'N', 'M'],
+)
 @triton.jit
 def auction_bid_kernel(
     benefits_ptr, # (B, N, M)
@@ -645,8 +660,20 @@ class AuctionTriton:
         if hasattr(torch, "compiler") and torch.compiler.is_compiling():
             is_compiling = True
             
-        use_cuda_graph = True and not is_compiling
         
+        # Generator Check
+        is_generator = hasattr(self.epsilon, '__next__')
+        current_epsilon = self.epsilon
+        if is_generator:
+            # If annealing, disable CUDA Graph for now (or strictly manage it).
+            # Changing scalar args requires re-capture or tensor-based args.
+            use_cuda_graph = False 
+            # Initialize
+            try:
+                current_epsilon = next(self.epsilon)
+            except StopIteration:
+                pass
+
         # Define the burst sequence
         def run_check_step():
              # Single step logic
@@ -654,11 +681,10 @@ class AuctionTriton:
              auction_bid_kernel[grid](
                  benefits, prices, assignment,
                  best_idx, increments,
-                 self.epsilon,
+                 current_epsilon, # Use local var
                  B, N, M,
                  benefits.stride(0), benefits.stride(1),
                  prices.stride(0),
-                 BLOCK_SIZE=BLOCK_SIZE
              )
              
              proposals.zero_()
@@ -717,6 +743,13 @@ class AuctionTriton:
         else:
             # Fallback manual loop
             for i in range(self.max_iter):
+                 # Update Epsilon if generator
+                 if is_generator and i > 0:
+                    try:
+                        current_epsilon = next(self.epsilon)
+                    except StopIteration:
+                        pass
+                        
                  unassigned_count = (assignment == -1).sum().item()
                  if unassigned_count == 0:
                      break
