@@ -31,7 +31,17 @@ def update_best(
         triton.Config({'BLOCK_N': 64, 'BLOCK_M': 64}, num_warps=4, num_stages=4),
         triton.Config({'BLOCK_N': 128, 'BLOCK_M': 64}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 128, 'BLOCK_M': 128}, num_warps=8, num_stages=4),
-        triton.Config({'BLOCK_N': 32, 'BLOCK_M': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 64, 'BLOCK_M': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 64, 'BLOCK_M': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_M': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_M': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 64, 'BLOCK_M': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_N': 64, 'BLOCK_M': 128}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_M': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_M': 128}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_N': 32, 'BLOCK_M': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_M': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 64, 'BLOCK_M': 256}, num_warps=8, num_stages=3),
     ],
     key=['B', 'N', 'M', 'D'],
 )
@@ -298,7 +308,7 @@ class AuctionImplicitTriton:
         
         # Bid-Resolve Loop
         
-        from .triton_backend import auction_scatter_kernel_2d, auction_resolve_kernel_2d
+        from efficient_linear_assignment.auction.triton_backend import auction_scatter_kernel_2d, auction_resolve_kernel_2d
         
         # Proposals: (B, M) -- Packed (bid, agent)
         proposals = torch.zeros((B, M), device=device, dtype=torch.int64)

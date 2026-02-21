@@ -7,3 +7,7 @@ from .dual_ascent import api as dual_ascent
 from .routing import max_score_routing
 from .sinkhorn.api import log_stabilized_sinkhorn
 from .dual_ascent.api import l2_regularized_dual_ascent
+
+# Flash (Implicit) Solvers
+from . import flash_dual_ascent
+from . import flash_auction

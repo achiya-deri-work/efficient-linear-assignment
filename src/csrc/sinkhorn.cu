@@ -28,7 +28,13 @@ __global__ void sinkhorn_persistent_kernel(
     typedef cub::BlockReduce<float, 256> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
     __shared__ float block_max;
-    // Removed unused block_sum_exp
+
+    // Custom max operator
+    struct MaxOp {
+        __device__ __forceinline__ float operator()(const float &a, const float &b) const {
+            return fmaxf(a, b);
+        }
+    };
     
     int tid = threadIdx.x;
     int bid = blockIdx.x;
@@ -75,7 +81,7 @@ __global__ void sinkhorn_persistent_kernel(
             }
             
             // Reduce
-            float row_max = BlockReduce(temp_storage).Reduce(m_i, cub::Max());
+            float row_max = BlockReduce(temp_storage).Reduce(m_i, MaxOp());
             __syncthreads();
             if (tid == 0) block_max = row_max;
             __syncthreads();
@@ -122,7 +128,7 @@ __global__ void sinkhorn_persistent_kernel(
                 m_i = new_m;
             }
             
-            float col_max = BlockReduce(temp_storage).Reduce(m_i, cub::Max());
+            float col_max = BlockReduce(temp_storage).Reduce(m_i, MaxOp());
             __syncthreads();
             if (tid == 0) block_max = col_max;
             __syncthreads();

@@ -159,21 +159,6 @@ def find_top2_kernel(
 # Each block handles one row (Agent).
 # Threads load chunks of M, compute local top2, then reduce across threads.
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE': 128}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=4),
-        triton.Config({'BLOCK_SIZE': 256}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=4),
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=4),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=4),
-    ],
-    key=['B', 'N', 'M'],
-)
 @triton.jit
 def auction_bid_kernel(
     benefits_ptr, # (B, N, M)
@@ -664,6 +649,11 @@ class AuctionTriton:
         # Generator Check
         is_generator = hasattr(self.epsilon, '__next__')
         current_epsilon = self.epsilon
+        
+        # Default CUDA Graph Usage
+        # Enabling CUDA graphs improves launch latency for small iterations
+        use_cuda_graph = not is_generator and not is_compiling and self.max_iter > 50
+
         if is_generator:
             # If annealing, disable CUDA Graph for now (or strictly manage it).
             # Changing scalar args requires re-capture or tensor-based args.
@@ -685,6 +675,7 @@ class AuctionTriton:
                  B, N, M,
                  benefits.stride(0), benefits.stride(1),
                  prices.stride(0),
+                 BLOCK_SIZE=BLOCK_SIZE
              )
              
              proposals.zero_()

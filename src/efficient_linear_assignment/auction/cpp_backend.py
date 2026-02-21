@@ -21,8 +21,7 @@ class AuctionCPPCCUDA(AuctionTorch):
             res = efficient_linear_assignment_cpp.solve_auction_cuda(
                 cost_matrix, 
                 self.epsilon, 
-                self.max_iter,
-                persistent_mode
+                self.max_iter
             )
             # res[0] is assignment, res[1] is prices
             return res[0], res[1]

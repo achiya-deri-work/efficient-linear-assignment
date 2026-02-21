@@ -18,7 +18,12 @@ setup(
             sources=sources,
             include_dirs=[os.path.abspath('src/csrc'), os.path.abspath('third_party/cutlass/include')],
             extra_compile_args={'cxx': ['-O3'],
-                                'nvcc': ['-O3', '--use_fast_math']}
+                                'nvcc': ['-O3', '--use_fast_math',
+                                         '-gencode=arch=compute_80,code=sm_80', 
+                                         '-gencode=arch=compute_89,code=sm_89', 
+                                         '-gencode=arch=compute_90,code=sm_90',
+                                         '-gencode=arch=compute_89,code=compute_89', # PTX for Ada (Safe JIT fallback for Blackwell)
+                                         ]}
         )
     ],
     cmdclass={

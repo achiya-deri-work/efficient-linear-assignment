@@ -3,8 +3,7 @@
 #include <torch/types.h>
 #include <cub/cub.cuh>
 #include <cooperative_groups.h>
-
-namespace cg = cooperative_groups;
+#include "common.cuh"
 
 // Helpers
 __device__ __forceinline__ unsigned int float_to_ordered_int(float f) {
@@ -30,39 +29,6 @@ __device__ __forceinline__ void unpack_bid(unsigned long long packed, float* pri
     *agent_id = static_cast<int>(packed & 0xFFFFFFFF);
 }
 
-// Global Barrier (Dummy)
-struct GlobalBarrier {
-    unsigned int* count;
-    unsigned int* sense;
-    int expected_blocks;
-
-    __device__ void sync() {
-        __threadfence();
-        
-        // Elect a leader for the block (tid 0)
-        int tid = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
-        
-        if (tid == 0) {
-            unsigned int my_sense = atomicAdd(sense, 0); // atomicLoad ref
-            unsigned int arrive = atomicAdd(count, 1);
-            
-            if (arrive == expected_blocks - 1) {
-                // Last block to arrive
-                atomicExch(count, 0);
-                atomicExch(sense, !my_sense);
-            } else {
-                // Wait for sense to flip
-                while (atomicAdd(sense, 0) == my_sense) {
-                    __threadfence_block(); 
-                    #if __CUDA_ARCH__ >= 700
-                    __nanosleep(100); 
-                    #endif
-                }
-            }
-        }
-        __syncthreads();
-    }
-};
 
 // Device logic placeholder
 template <typename scalar_t>
@@ -409,193 +375,11 @@ __global__ void auction_persistent_kernel_warp(
     }
 } 
 
-// Legacy Wrappers
-template <typename scalar_t>
-__global__ void match_bid_kernel_wrapper(
-    const scalar_t* __restrict__ benefits,
-    const float* __restrict__ prices,
-    const int64_t* __restrict__ assignment,
-    int64_t* __restrict__ best_idx_out,
-    float* __restrict__ increments_out,
-    float epsilon,
-    int B, int N, int M,
-    int stride_bn, int stride_bm, int stride_bp
-) {
-    int row = blockIdx.x;
-    int batch = blockIdx.y;
-    int agent_idx = batch * N + row;
-    if (batch >= B || row >= N) return;
-
-    match_bid_device<scalar_t>(
-        agent_idx, benefits, prices, assignment, best_idx_out, increments_out,
-        epsilon, B, N, M, stride_bn, stride_bm, stride_bp
-    );
-}
-
-__global__ void reset_proposals_wrapper(unsigned long long* proposals, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) proposals[idx] = 0;
-}
-
-__global__ void scatter_kernel_wrapper(
-     const int64_t* __restrict__ best_idx,
-     const float* __restrict__ increments,
-     const float* __restrict__ prices,
-     const int64_t* __restrict__ assignment,
-     unsigned long long* __restrict__ proposals,
-     int B, int N, int M
-) {
-    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (global_id >= B * N) return;
-    
-    int batch = global_id / N;
-    int row = global_id % N;
-    
-    if (assignment[global_id] != -1) return;
-    int64_t target = best_idx[global_id];
-    if (target == -1) return;
-    
-    float inc = increments[global_id];
-    float current_p = prices[batch * M + target];
-    float new_bid = current_p + inc;
-    unsigned long long packed = pack_bid(new_bid, row);
-    
-    atomicMax(&proposals[batch * M + target], packed);
-}
-
-__global__ void resolve_kernel_wrapper(
-    const int64_t* __restrict__ best_idx,
-    int64_t* __restrict__ assignment,
-    float* __restrict__ prices,
-    const unsigned long long* __restrict__ proposals,
-    int64_t* __restrict__ owners, // (B, M)
-    int* __restrict__ unassigned_count, 
-    int B, int N, int M
-) {
-    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (global_id >= B * N) return;
-    int batch = global_id / N;
-    int row = global_id % N; 
-    
-    if (assignment[global_id] != -1) return;
-    int64_t target = best_idx[global_id];
-    if (target == -1) return;
-    
-    unsigned long long winning = proposals[batch * M + target];
-    if (winning == 0) return; 
-    
-    float win_p;
-    int win_agent;
-    unpack_bid(winning, &win_p, &win_agent);
-    
-    if (win_agent == row) {
-        assignment[global_id] = target;
-        prices[batch * M + target] = win_p;
-        
-        unsigned long long* owner_addr = (unsigned long long*)(owners + batch * M + target);
-        unsigned long long val = (unsigned long long)row;
-        unsigned long long old = atomicExch(owner_addr, val);
-        int64_t old_owner = (int64_t)old;
-
-        if (old_owner != -1) {
-            assignment[batch * N + old_owner] = -1;
-        }
-    }
-}
-
-void launch_bid_kernel_cuda(
-    torch::Tensor benefits,
-    torch::Tensor prices,
-    torch::Tensor assignment,
-    torch::Tensor best_idx,
-    torch::Tensor increments,
-    double epsilon
-) {
-    int B = benefits.size(0);
-    int N = benefits.size(1);
-    int M = benefits.size(2);
-    
-    // Coalescing Checks: Ensure last dim stride is 1 and row stride is aligned
-    TORCH_CHECK(benefits.stride(2) == 1, "Benefits must be contiguous in last dim");
-    // For 128-bit loads (float4), stride should be multiple of 4 (if float) or 8 (if half)
-    // Here strictly checking multiple of 8 covers both.
-    // TORCH_CHECK(benefits.stride(1) % 8 == 0, "Benefits row stride must be aligned to 8 elements");
-
-    dim3 grid(N, B);
-    AT_DISPATCH_FLOATING_TYPES(benefits.scalar_type(), "match_bid_kernel", ([&] {
-        match_bid_kernel_wrapper<scalar_t><<<grid, 256>>>(
-            benefits.data_ptr<scalar_t>(),
-            prices.data_ptr<float>(),     
-            assignment.data_ptr<int64_t>(),
-            best_idx.data_ptr<int64_t>(),
-            increments.data_ptr<float>(), 
-            (float)epsilon,
-            B, N, M,
-            benefits.stride(0), benefits.stride(1),
-            prices.stride(0)
-        );
-    }));
-}
-
-void launch_reset_proposals(torch::Tensor proposals) {
-    int size = proposals.numel();
-    int block = 256;
-    int grid = (size + block - 1) / block;
-    reset_proposals_wrapper<<<grid, block>>>(proposals.data_ptr<unsigned long long>(), size);
-}
-
-void launch_scatter(
-    torch::Tensor best_idx,
-    torch::Tensor increments,
-    torch::Tensor prices,
-    torch::Tensor assignment,
-    torch::Tensor proposals
-) {
-    int B = best_idx.size(0);
-    int N = best_idx.size(1);
-    int M = prices.size(1);
-    int block = 256;
-    int grid = (B*N + block - 1) / block;
-    
-    scatter_kernel_wrapper<<<grid, block>>>(
-        best_idx.data_ptr<int64_t>(),
-        increments.data_ptr<float>(),
-        prices.data_ptr<float>(),
-        assignment.data_ptr<int64_t>(),
-        proposals.data_ptr<unsigned long long>(),
-        B, N, M
-    );
-}
-
-void launch_resolve(
-    torch::Tensor best_idx,
-    torch::Tensor assignment,
-    torch::Tensor prices,
-    torch::Tensor proposals,
-    torch::Tensor owners
-) {
-    int B = best_idx.size(0);
-    int N = best_idx.size(1);
-    int M = prices.size(1);
-    int block = 256;
-    int grid = (B*N + block - 1) / block;
-    resolve_kernel_wrapper<<<grid, block>>>(
-        best_idx.data_ptr<int64_t>(),
-        assignment.data_ptr<int64_t>(),
-        prices.data_ptr<float>(),
-        proposals.data_ptr<unsigned long long>(),
-        owners.data_ptr<int64_t>(),
-        nullptr, 
-        B, N, M
-    );
-}
-
 // Host Function
 std::vector<torch::Tensor> solve_auction_cuda(
     torch::Tensor cost_matrix,
     float epsilon,
-    int max_iter,
-    bool persistent_mode 
+    int max_iter
 ) {
     torch::Tensor benefits = -cost_matrix;
     int B = benefits.size(0);
@@ -619,111 +403,89 @@ std::vector<torch::Tensor> solve_auction_cuda(
     auto d_unassigned_cnt = torch::zeros({1}, options.dtype(torch::kInt32)); 
     
     // Barrier State
-    auto barrier_state = torch::empty({0}, options.dtype(torch::kInt32)); 
+    auto barrier_state = torch::zeros({2}, options.dtype(torch::kInt32));
+    
+    // Persistent Kernel Launch
+    int block_size = 256;
+    
+    int device_id = benefits.get_device();
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device_id);
+    
+    bool use_warp_mode = (N <= 128);
 
-    if (persistent_mode) {
-        // Persistent Kernel Launch
-        int block_size = 256;
+    AT_DISPATCH_FLOATING_TYPES(benefits.scalar_type(), "auction_persistent_wrapper", ([&] {
+        int max_blocks_per_sm = 0;
         
-        int device_id = benefits.get_device();
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, device_id);
-        
-        // Init Barrier header
-        barrier_state = torch::zeros({2}, options.dtype(torch::kInt32));
-        
-        bool use_warp_mode = (N <= 128);
-
-        AT_DISPATCH_FLOATING_TYPES(benefits.scalar_type(), "auction_persistent_wrapper", ([&] {
-            int max_blocks_per_sm = 0;
+        if (use_warp_mode) {
+            // Warp Dispatch
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &max_blocks_per_sm,
+                auction_persistent_kernel_warp<scalar_t>,
+                block_size,
+                0
+            );
             
-            if (use_warp_mode) {
-                // Warp Dispatch
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                    &max_blocks_per_sm,
-                    auction_persistent_kernel_warp<scalar_t>,
-                    block_size,
-                    0
-                );
-                
-                int grid_size = prop.multiProcessorCount * max_blocks_per_sm;
-                int agents_per_block = block_size / 32;
-                int min_needed = (B * N + agents_per_block - 1) / agents_per_block;
-                if (grid_size > min_needed) grid_size = min_needed;
-                
-                auction_persistent_kernel_warp<scalar_t><<<grid_size, block_size>>>(
-                    benefits.data_ptr<scalar_t>(),
-                    prices.data_ptr<float>(),
-                    assignment.data_ptr<int64_t>(),
-                    best_idx.data_ptr<int64_t>(),
-                    increments.data_ptr<float>(),
-                    proposals.data_ptr<unsigned long long>(),
-                    owners.data_ptr<int64_t>(),
-                    (unsigned int*)d_unassigned_cnt.data_ptr<int>(), 
-                    (unsigned int*)barrier_state.data_ptr<int>(),    
-                    d_unassigned_cnt.data_ptr<int>(),
-                    B, N, M,
-                    benefits.stride(0), benefits.stride(1), benefits.stride(2),
-                    (float)epsilon,
-                    max_iter
-                );
-            } else {
-                // Block Dispatch
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                    &max_blocks_per_sm,
-                    auction_persistent_kernel<scalar_t>,
-                    block_size,
-                    0
-                );
-                
-                int grid_size = prop.multiProcessorCount * max_blocks_per_sm;
-                if (grid_size > B * N) grid_size = B * N;
-                
-                auction_persistent_kernel<scalar_t><<<grid_size, block_size>>>(
-                    benefits.data_ptr<scalar_t>(),
-                    prices.data_ptr<float>(),
-                    assignment.data_ptr<int64_t>(),
-                    best_idx.data_ptr<int64_t>(),
-                    increments.data_ptr<float>(),
-                    proposals.data_ptr<unsigned long long>(),
-                    owners.data_ptr<int64_t>(),
-                    (unsigned int*)d_unassigned_cnt.data_ptr<int>(),
-                    (unsigned int*)barrier_state.data_ptr<int>(),
-                    d_unassigned_cnt.data_ptr<int>(),
-                    B, N, M,
-                    benefits.stride(0), benefits.stride(1), benefits.stride(2),
-                    (float)epsilon,
-                    max_iter
-                );
-            }
-        }));
-    } else {
-        // Legacy Host Loop
-        int check_interval = 20;
-        
-        for(int i = 0; i < max_iter; i++) {
-             bool do_check = (i % check_interval == 0) || (i == max_iter - 1);
-        
-             // Bid (Reuse existing launch helper)
-             launch_bid_kernel_cuda(
-                 benefits, prices, assignment, best_idx, increments, epsilon
-             );
-             
-             // Reset
-             launch_reset_proposals(proposals);
-             
-             // Scatter
-             launch_scatter(best_idx, increments, prices, assignment, proposals);
-             
-             // Resolve
-             launch_resolve(best_idx, assignment, prices, proposals, owners);
-             
-             if (do_check) {
-                 int cnt = (assignment.view(-1) == -1).sum().item<int>();
-                 if (cnt == 0) break;
-             }
+            int grid_size = prop.multiProcessorCount * max_blocks_per_sm;
+            int agents_per_block = block_size / 32;
+            int min_needed = (B * N + agents_per_block - 1) / agents_per_block;
+            if (grid_size > min_needed) grid_size = min_needed;
+            
+            // Host Barrier Init
+            GlobalBarrier barrier_host;
+            barrier_host.init((unsigned int*)barrier_state.data_ptr<int>(), (unsigned int*)barrier_state.data_ptr<int>() + 1, grid_size);
+
+            auction_persistent_kernel_warp<scalar_t><<<grid_size, block_size>>>(
+                benefits.data_ptr<scalar_t>(),
+                prices.data_ptr<float>(),
+                assignment.data_ptr<int64_t>(),
+                best_idx.data_ptr<int64_t>(),
+                increments.data_ptr<float>(),
+                (unsigned long long*)proposals.data_ptr<int64_t>(),
+                owners.data_ptr<int64_t>(),
+                (unsigned int*)d_unassigned_cnt.data_ptr<int>(), 
+                (unsigned int*)barrier_state.data_ptr<int>(),    
+                d_unassigned_cnt.data_ptr<int>(),
+                B, N, M,
+                benefits.stride(0), benefits.stride(1), benefits.stride(2),
+                (float)epsilon,
+                max_iter
+            );
+        } else {
+            // Block Dispatch
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &max_blocks_per_sm,
+                auction_persistent_kernel<scalar_t>,
+                block_size,
+                0
+            );
+            
+            int grid_size = prop.multiProcessorCount * max_blocks_per_sm;
+            if (grid_size > B * N) grid_size = B * N;
+
+             // Host Barrier Init
+            GlobalBarrier barrier_host;
+            barrier_host.init((unsigned int*)barrier_state.data_ptr<int>(), (unsigned int*)barrier_state.data_ptr<int>() + 1, grid_size);
+            
+            auction_persistent_kernel<scalar_t><<<grid_size, block_size>>>(
+                benefits.data_ptr<scalar_t>(),
+                prices.data_ptr<float>(),
+                assignment.data_ptr<int64_t>(),
+                best_idx.data_ptr<int64_t>(),
+                increments.data_ptr<float>(),
+                (unsigned long long*)proposals.data_ptr<int64_t>(),
+                owners.data_ptr<int64_t>(),
+                (unsigned int*)d_unassigned_cnt.data_ptr<int>(),
+                (unsigned int*)barrier_state.data_ptr<int>(),
+                d_unassigned_cnt.data_ptr<int>(),
+                B, N, M,
+                benefits.stride(0), benefits.stride(1), benefits.stride(2),
+                (float)epsilon,
+                max_iter
+            );
         }
-    }
+    }));
     
     return {assignment, prices, barrier_state};
 }
+
